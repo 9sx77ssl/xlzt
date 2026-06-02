@@ -1,0 +1,32 @@
+name: release
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+concurrency:
+  group: release
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y mold
+      - run: |
+          curl -fsSL https://github.com/upx/upx/releases/download/v5.1.1/upx-5.1.1-amd64_linux.tar.xz | tar -xJ
+          sudo install -m755 upx-5.1.1-amd64_linux/upx /usr/local/bin/upx
+      - run: cargo build --release
+        env:
+          LZT_VERSION: v0.1.${{ github.run_number }}
+          RUSTFLAGS: -Clink-arg=-fuse-ld=mold
+      - run: upx --best --lzma target/release/lzt
+      - run: sha256sum target/release/lzt | awk '{print $1}' > target/release/lzt.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          make_latest: 'true'
+          files: |
+            target/release/lzt
+            target/release/lzt.sha256
