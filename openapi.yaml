@@ -1,0 +1,476 @@
+openapi: 3.0.3
+
+info:
+  title: Y7cdn Public API
+  version: 2.0.0
+  description: |
+    Public endpoints for the Y7cdn self-hosted CDN service.
+    Base URL: `https://y7v.lol`
+
+    No authentication is required for any endpoint in this spec.
+    See `admin_openapi.yaml` for protected admin endpoints.
+
+servers:
+  - url: https://y7v.lol
+
+tags:
+  - name: files
+    description: Upload and retrieve files
+  - name: system
+    description: Health and statistics
+
+paths:
+  # ── Upload ───────────────────────────────────────────────────────────────────
+  /api/upload:
+    post:
+      tags: [files]
+      summary: Upload a file
+      description: |
+        `multipart/form-data`, field name `file`. No auth required.
+
+        **Max size:** 500 MB · **Rate limit:** 1500 req/min per IP
+
+        SHA-256 content deduplication: uploading the same content twice returns
+        the existing record with `"duplicate": true` and HTTP 200.
+
+        **EXIF metadata stripping:** JPEG, HEIC/HEIF, and TIFF uploads have all
+        EXIF metadata (GPS, camera serial, timestamps) removed before the file
+        is hashed and stored. Stripping happens BEFORE deduplication so two
+        identical photos with different EXIF still dedup correctly. Controlled
+        by the `STRIP_EXIF` env var (default: true). Failure to strip is
+        non-fatal — the original bytes are kept and a warning is logged.
+
+        **Accepted MIME types / extensions:**
+        - Images: jpg, jpeg, png, gif, webp, svg, avif, tiff, bmp, ico, heic
+        - Video: mp4, webm, mov, mkv, avi
+        - Audio: mp3, ogg, wav, aac, flac
+        - Fonts: woff, woff2, ttf, otf, eot
+        - Web assets: css  (js / mjs / html intentionally rejected — see below)
+        - Data/config: json, yaml, yml, xml, csv, toml, tsv
+        - Text/docs: pdf, txt, md, rst, epub
+        - Not allowed: text/html, text/javascript, application/javascript
+          (CDN-hosted phishing pages and third-party CSP bypass risks)
+        - Archives: zip, rar, 7z, gz, tar, bz2, xz, zst
+        - Office: docx, xlsx, pptx, odt
+      parameters:
+        - name: password
+          in: query
+          required: false
+          schema: { type: string, minLength: 4, maxLength: 128 }
+          description: |
+            Fallback per-file password (4-128 printable ASCII chars). The
+            preferred way to send a password is the multipart `password` field
+            because multipart bodies are not written to nginx access logs.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+                password:
+                  type: string
+                  minLength: 4
+                  maxLength: 128
+                  description: |
+                    Optional per-file password (printable ASCII, 4-128 chars).
+                    When set, the file can only be fetched from `/f/<name>` by a
+                    caller that supplies the same password via `?password=` or
+                    the `X-File-Password` header. Wrong/missing password → 404.
+                    A protected upload BYPASSES SHA-256 dedup — it is always
+                    stored as a new row so the protected/unprotected variants
+                    of the same content stay separate.
+      responses:
+        "201":
+          description: Uploaded successfully
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadResponse" }
+              example:
+                id: "550e8400-e29b-41d4-a716-446655440000"
+                original_name: "photo.jpg"
+                stored_name: "abc123.jpg"
+                mime_type: "image/jpeg"
+                size: 204800
+                upload_date: "2026-05-17T17:51:22Z"
+                upload_date_unix: 1779037882
+                url: "https://y7v.lol/f/abc123.jpg"
+                category: "images"
+                file_hash: "a828e32685e292787c7a21837e63200fff0520e3ec4855c797ffa037e286c535"
+                uploader_ip: "1.2.3.4"
+                duplicate: false
+        "200":
+          description: Duplicate — file already exists, same content returned
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UploadResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "413": { $ref: "#/components/responses/FileTooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMediaType" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  # ── Batch upload ─────────────────────────────────────────────────────────────
+  /api/upload/batch:
+    post:
+      tags: [files]
+      summary: Upload multiple files in one request
+      description: |
+        Same as `/api/upload` but accepts multiple `file` fields.
+        Each file is processed independently — one failure does not abort others.
+
+        **Max total size:** 5 GB · **Rate limit:** shared with `/api/upload`
+
+        HTTP response status:
+        - `200` — all files succeeded
+        - `207 Multi-Status` — mixed results (some ok, some failed)
+        - `400` — no files provided
+        - `429` — rate limited
+      parameters:
+        - name: password
+          in: query
+          required: false
+          schema: { type: string, minLength: 4, maxLength: 128 }
+          description: |
+            Fallback password applied to every `file` in the batch. Prefer the
+            multipart `password` field — it is not logged by nginx.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: array
+                  items: { type: string, format: binary }
+                password:
+                  type: string
+                  minLength: 4
+                  maxLength: 128
+                  description: |
+                    Optional per-batch password. When supplied, EVERY file in
+                    this batch is stored with the same Argon2id-hashed password.
+                    Protected uploads bypass dedup.
+      responses:
+        "200":
+          description: All files processed successfully
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchUploadResponse" }
+              example:
+                total: 2
+                succeeded: 2
+                failed: 0
+                files:
+                  - ok: true
+                    id: "550e8400-e29b-41d4-a716-446655440000"
+                    stored_name: "abc.jpg"
+                    url: "https://y7v.lol/f/abc.jpg"
+                    size: 204800
+                    duplicate: false
+                  - ok: true
+                    id: "660e8400-e29b-41d4-a716-446655440001"
+                    stored_name: "xyz.png"
+                    url: "https://y7v.lol/f/xyz.png"
+                    size: 51200
+                    duplicate: true
+        "207":
+          description: Mixed results — some files succeeded, some failed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BatchUploadResponse" }
+              example:
+                total: 2
+                succeeded: 1
+                failed: 1
+                files:
+                  - ok: true
+                    stored_name: "abc.jpg"
+                    url: "https://y7v.lol/f/abc.jpg"
+                    size: 204800
+                    duplicate: false
+                  - ok: false
+                    error: "UNSUPPORTED_MEDIA_TYPE"
+                    message: "'application/x-php' is not an accepted file type"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  # ── File delivery ────────────────────────────────────────────────────────────
+  /f/{filename}:
+    get:
+      tags: [files]
+      summary: Download / stream a file
+      description: |
+        Streams the stored file. Supports:
+        - `Range` header → 206 Partial Content
+        - `If-None-Match` / `If-Modified-Since` → 304 Not Modified
+        - `Cache-Control: public, max-age=31536000` on unprotected responses
+        - SVGs and HTML served with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'`
+
+        **Per-file password protection.** If the file was uploaded with a
+        password, the request MUST supply it via either:
+        - query string: `?password=...`, or
+        - HTTP header: `X-File-Password: ...` (preferred — not logged; wins
+          over the query parameter when both are present).
+
+        Wrong or missing password returns the SAME 404 response as a missing
+        file, intentionally hiding the existence of protected resources.
+
+        When any password is supplied (correct or wrong), the response is
+        served with `Cache-Control: private, no-store` so shared caches and
+        CDNs never reuse the body across viewers.
+      parameters:
+        - name: filename
+          in: path
+          required: true
+          schema: { type: string }
+          example: "abc123.jpg"
+        - name: password
+          in: query
+          required: false
+          schema: { type: string }
+          description: |
+            Per-file password. Prefer the `X-File-Password` header to keep the
+            secret off URLs and nginx logs (the access log additionally redacts
+            `password=` query values, but headers never appear in logs at all).
+        - name: X-File-Password
+          in: header
+          required: false
+          schema: { type: string }
+          description: Per-file password. Wins over `?password=` when both are set.
+      responses:
+        "200": { description: Full file content }
+        "206": { description: Partial content (Range request) }
+        "304": { description: Not modified (conditional request) }
+        "404":
+          description: |
+            File not found — OR — wrong/missing password on a protected file.
+            Identical body in both cases (existence-hiding).
+          content:
+            text/plain:
+              example: "not found ^.^"
+        "416": { description: Range not satisfiable }
+
+  # ── Stats ────────────────────────────────────────────────────────────────────
+  /api/stats:
+    get:
+      tags: [system]
+      summary: CDN statistics (cached)
+      description: |
+        Returns aggregated file statistics. No auth required.
+        Response is cached server-side; TTL is controlled by the
+        `stats_cache_ttl_s` admin setting (default 60 s).
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StatsResponse" }
+              example:
+                total_files: 1234
+                total_size_bytes: 5368709120
+                total_downloads: 98765
+                uploads_today: 12
+                uploads_week: 84
+                uploads_month: 320
+                avg_file_size_bytes: 4350852
+                avg_per_day_30d: 10.67
+                by_category: { images: 900, video: 200, audio: 80, other: 54 }
+                by_category_size: { images: 2147483648, video: 2684354560, audio: 536870912, other: 104857600 }
+                top_mime_types:
+                  - { mime: "image/jpeg", count: 600 }
+                  - { mime: "image/png", count: 300 }
+                cached_at: 1779037882
+
+  # ── Health ───────────────────────────────────────────────────────────────────
+  /health:
+    get:
+      tags: [system]
+      summary: System health check
+      description: |
+        Returns service health information. No auth required.
+        The response is cached server-side for `health_cache_ttl_s` seconds
+        (default 5) so repeat-polling is cheap. Returns HTTP 503 if the
+        service is degraded (e.g. database unreachable).
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              example:
+                status: "ok"
+                uptime_seconds: 86400
+                database: "ok"
+                files_count: 1234
+                storage:
+                  total_bytes: 107374182400
+                  used_bytes: 21474836480
+                  free_bytes: 85899345920
+                  used_percent: 20.0
+                memory:
+                  total_bytes: 8589934592
+                  used_bytes: 2147483648
+                  free_bytes: 6442450944
+        "503":
+          description: Service degraded
+          content:
+            application/json:
+              example:
+                status: "degraded"
+                database: "error"
+
+# ─────────────────────────────────────────────────────────────────────────────
+components:
+  schemas:
+    FileEntry:
+      type: object
+      properties:
+        id:             { type: string, format: uuid }
+        original_name:  { type: string }
+        stored_name:    { type: string }
+        mime_type:      { type: string }
+        size:           { type: integer, format: int64, description: Size in bytes }
+        upload_date:    { type: string, format: date-time }
+        upload_date_unix: { type: integer, description: Unix timestamp in seconds }
+        category:       { type: string, enum: [images, video, audio, fonts, other] }
+        file_hash:      { type: string, description: SHA-256 hex digest }
+        uploader_ip:    { type: string, nullable: true }
+        user_agent:     { type: string, nullable: true }
+        download_count: { type: integer, format: int64, description: Total times served via /f/ }
+        password_protected:
+          type: boolean
+          description: |
+            true if a per-file password must be supplied to fetch this file via
+            `/f/<stored_name>`. Set at upload time via the `password` field or
+            later by an admin via PATCH `/api/file/{name}/password`. The
+            password hash itself is never returned.
+        url:            { type: string, description: Full public URL }
+
+    UploadResponse:
+      allOf:
+        - $ref: "#/components/schemas/FileEntry"
+        - type: object
+          properties:
+            duplicate: { type: boolean, description: true if content already existed }
+
+    BatchUploadResponse:
+      type: object
+      required: [total, succeeded, failed, files]
+      properties:
+        total:     { type: integer, description: Total files received }
+        succeeded: { type: integer, description: Files uploaded or deduplicated }
+        failed:    { type: integer, description: Files that failed validation }
+        files:
+          type: array
+          description: Per-file result in multipart field order
+          items:
+            oneOf:
+              - allOf:
+                  - $ref: "#/components/schemas/UploadResponse"
+                  - type: object
+                    properties:
+                      ok: { type: boolean, enum: [true] }
+              - type: object
+                required: [ok, error, message]
+                properties:
+                  ok:      { type: boolean, enum: [false] }
+                  error:   { type: string, example: UNSUPPORTED_MEDIA_TYPE }
+                  message: { type: string }
+
+    StatsResponse:
+      type: object
+      properties:
+        total_files:        { type: integer }
+        total_size_bytes:   { type: integer, format: int64 }
+        uploads_today:      { type: integer }
+        uploads_week:       { type: integer }
+        uploads_month:      { type: integer }
+        avg_file_size_bytes: { type: integer }
+        avg_per_day_30d:    { type: number, format: double }
+        by_category:
+          type: object
+          additionalProperties: { type: integer }
+          description: File count per category
+        by_category_size:
+          type: object
+          additionalProperties: { type: integer }
+          description: Total bytes per category
+        top_mime_types:
+          type: array
+          items:
+            type: object
+            properties:
+              mime:  { type: string }
+              count: { type: integer }
+        largest_files:
+          type: array
+          items:
+            type: object
+            properties:
+              stored_name:   { type: string }
+              original_name: { type: string }
+              size:          { type: integer }
+              url:           { type: string }
+              mime_type:     { type: string }
+        total_downloads:    { type: integer, format: int64, description: Sum of download_count across all files }
+        cached_at:
+          { type: integer, description: Unix timestamp of last cache refresh }
+
+    ErrorResponse:
+      description: |
+        Flat error envelope. All responses include `X-Request-Id` header.
+        429 responses include a `Retry-After` header (seconds).
+      type: object
+      required: [error, message]
+      properties:
+        error:       { type: string, example: FILE_TOO_LARGE }
+        message:     { type: string, example: "File exceeds the 500 MB limit" }
+        max_bytes:   { type: integer, description: "[FILE_TOO_LARGE] limit in bytes" }
+        mime_type:   { type: string,  description: "[UNSUPPORTED_MEDIA_TYPE] rejected MIME" }
+        retry_after: { type: integer, description: "[RATE_LIMITED] seconds to wait" }
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: BAD_REQUEST
+            message: "Multipart body must contain a field named 'file'"
+
+    FileTooLarge:
+      description: File exceeds the size limit
+      headers:
+        X-Request-Id: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: FILE_TOO_LARGE
+            message: "File exceeds the 500 MB limit"
+            max_bytes: 524288000
+
+    UnsupportedMediaType:
+      description: MIME type not on the allowlist
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: UNSUPPORTED_MEDIA_TYPE
+            message: "'application/x-php' is not an accepted file type"
+            mime_type: "application/x-php"
+
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:  { schema: { type: integer }, example: 60 }
+        X-Request-Id: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorResponse" }
+          example:
+            error: RATE_LIMITED
+            message: "Too many requests, slow down"
+            retry_after: 60
